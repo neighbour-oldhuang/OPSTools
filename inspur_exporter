@@ -1,0 +1,218 @@
+#!/usr/bin/env python
+#encoding: utf8
+from flask.globals import request
+import requests
+#import sys
+import os
+import re
+import time
+import threading
+from flask import Flask
+import logging
+
+###############################
+servers_status= {}
+web= Flask(__name__)
+
+def logfmt(*args):
+    newstr= ""
+    for x in args:
+        newstr+= str(x)+ " "
+    return newstr
+
+class exp_config:
+    def __init__(self):
+        if os.environ.get("THREADING_MAX"): self.threading_max= os.environ.get("THREADING_MAX")
+        if os.environ.get("THREADING_TIMEOUT"): self.threading_max= os.environ.get("THREADING_TIMEOUT")
+        if os.environ.get("SCHEDULER_PERIOD_S"): self.threading_max= os.environ.get("SCHEDULER_PERIOD_S")
+        if os.environ.get("DEBUG") == "True" or os.environ.get("DEBUG")== True: self.DEBUG= True
+    threading_max= 100
+    threading_timeout= 30
+    scheduler_period_s= 120
+    DEBUG= True
+
+class pserver():
+    """
+    server bmc 属性
+    """
+    def __init__(self):
+        if os.environ.get("AUTH_U"): self.data["UserName"]= os.environ.get("AUTH_U")
+        if os.environ.get("AUTH_P"): self.data["Password"]= os.environ.get("AUTH_P")
+    data= {"UserName": "admin", "Password": "666666"}
+    api_session= '/redfish/v1/SessionService/Sessions'
+    api_system= '/redfish/v1/Systems'
+    url_scheme= 'https://'
+
+def run_check(*args):
+    hostName= args[0]
+    url_prefix= pserver.url_scheme+ args[0]
+    healthRollup= {}
+    requests.packages.urllib3.disable_warnings()
+    #建立 session
+    authHeaders= {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36'}
+    url= url_prefix+ pserver.api_session
+    res_auth= requests.post(url= url,data= str(pserver.data), headers= authHeaders, verify=False)
+    #print(res_auth.text)
+    if 'X-Auth-Token' not in res_auth.headers:
+        logger.error(logfmt( "认证错误:", res_auth.headers, res_auth.text))
+        servers_status[hostName]= 'server_check_up 0'
+        return
+    authHeaders['X-Auth-Token']= res_auth.headers['X-Auth-Token']
+    sessionUrl= res_auth.headers['location']
+    logger.debug(logfmt(hostName, res_auth.headers['X-Auth-Token'], sessionUrl))
+    ##获取 system列表
+    system_res= requests.get(url= url_prefix+ pserver.api_system,headers= authHeaders, verify=False )
+    logger.debug(logfmt(system_res.text))
+    system_list= system_res.json()['Members']
+    system_url_list= [ url['@odata.id'] for url in system_list]
+    #logger.debug(logfmt(system_url_list))
+    
+    ## 获取磁盘列表
+    all_dc_url_list= []
+    for system_url in system_url_list:
+        logger.debug(logfmt(hostName, url_prefix, authHeaders['X-Auth-Token']))
+        res_disk_c= requests.get(url= url_prefix+ system_url+ "/Storages", headers= authHeaders,
+            verify=False)
+        print(res_disk_c.json())
+        disk_list= res_disk_c.json()['Members']
+        [ all_dc_url_list.append(disk['@odata.id']) for disk in disk_list ]
+    #print(all_dc_url_list)
+
+    for dc_url in all_dc_url_list:
+        #print("diskcontroller:", dc_url)
+        dc_name= dc_url.split('/')[-1]
+        if re.match(".*\d$", dc_url):
+            logger.debug(logfmt(hostName, url_prefix, authHeaders['X-Auth-Token']))
+            res= requests.get(url= url_prefix+ dc_url,headers= authHeaders,
+                verify=False)
+            #print("dc_info: ", str(res.json()))
+            healthRollup["server_status_dc{dc_name=\"%s\"}" %(dc_name)]= res.json()['Status']['HealthRollup']
+            #print('上面是 raid!'*3)
+            for disk in res.json()['Drives']:
+                disk_url= disk['@odata.id']
+                #print("查询磁盘: ", disk_url)
+                diskId= disk_url.split("/")[-1]
+                try:
+                    logger.debug(logfmt(hostName, url_prefix, authHeaders['X-Auth-Token']))
+                    res= requests.get(url= url_prefix+ disk_url,headers= authHeaders, verify= False)
+                    #print("磁盘结果: ", res.text)
+                    diskinfo= res.json()
+                    healthRollup["server_status_disk{dc_name=\"%s\",disk=\"%s\"}" %(
+                        dc_name, diskId)]= diskinfo["Status"]['Health']
+                except Exception as e:
+                    print("查询%s盘信息 error: " %disk_url, e.args)
+                    ##查询失败标记为2
+                    healthRollup["server_status_disk{dc_name=\"%s\",disk=\"%s\"}" %(
+                        dc_name, diskId)]= "2"
+        elif re.match('.*Diskbackplane$', dc_url):
+            try:
+                logger.debug(logfmt(hostName, url_prefix, authHeaders['X-Auth-Token']))
+                res= requests.get(url= url_prefix+ dc_url,headers= authHeaders, verify=False)
+                healthRollup['server_tempreature_dc{dc_name=\"%s\"}' %(dc_name)]= res.json()[
+                    'Backplaneinfo'][0]['tempreature']
+            except Exception as e:
+                print("查询dc %s温度 error: " %dc_url, e.args)
+                ##查询失败标记为2
+                healthRollup['server_tempreature_dc{dc_name=\"%s\"}' %(dc_name)]= "2"
+        else:
+            continue
+    requests.delete(url=url_prefix+ sessionUrl, headers= authHeaders, verify= False)
+    #res_del=requests.delete(url=url_prefix+ sessionUrl, headers= authHeaders, verify= False)
+    #logger.debug(res_del.text)
+
+    content= "#TYPE all gauge\nserver_check_up 1\n"
+    for k in healthRollup:
+        if healthRollup[k]== "OK":
+            healthRollup[k]= 1
+        elif not re.match('\d+', str(healthRollup[k])):
+            healthRollup[k]= 0
+        content= content+ k+ " "+ str(healthRollup[k])+ "\n"
+    ##放入缓存
+    servers_status[hostName]= content
+def schedule_task():
+    logger.info('开启定时任务中.....')
+    while True:
+        for t in servers_status:
+            #print('执行任务!!!!!!!!!',t)
+            monitor_task(t)
+            time.sleep(0.2)
+        time.sleep(exp_config.scheduler_period_s)
+
+def monitor_task(hostName):
+    #print('xxx'* 5, hostName)
+    #th_active= threading.activeCount() ##用来判断所哟 u任务是否均执行完毕,本场景用不上
+    ## 设置线程超时
+    threading.TIMEOUT_MAX= exp_config.threading_timeout
+    schedule_thname= "scheduler"
+    allth= [th.name for th in threading.enumerate()]
+    print(allth)
+    if schedule_thname not in allth:
+        logger.debug("定时任务没有运行!!!!!")
+        threading.Thread(target=schedule_task, name= schedule_thname).start()
+        return
+    if threading.active_count() == exp_config.threading_max:
+        logger.warn('线程繁忙, 慢慢等吧,或者调大线程数!')
+        return
+    if hostName not in allth:
+        try:
+            threading.Thread(target=run_check, args=(hostName,), name= hostName).start()
+            logger.info(logfmt('run task:', hostName))
+        except Exception as e:
+            logger.error(e.args)
+        return
+    else:
+        logger.warn('任务%s在跑了, 别崔!!!' %hostName)
+    logger.error(logfmt('异常流程!,%s' %hostName, allth))
+
+def prams2dict(prams):
+    #logger.debug(logfmt("请求参数:", prams))
+    pramsDict= {}
+    if re.match('&', prams):
+        for item in prams.split('&'):
+            pramsDict[item.split('=')[0]]= item.split('=')[1]
+    else:
+        pramsDict[prams.split('=')[0]]= prams.split('=')[1]
+    return pramsDict
+
+@web.route('/metrics')
+def metrics():
+    prams= bytes.decode(request.query_string)
+    http_status= 200
+    if len(prams) > 1:
+        pramsDict= prams2dict(prams)
+        if pramsDict['target'] in servers_status:
+            content= servers_status[pramsDict['target']]
+        elif not re.match("^([0-9]{1,3}\.){3}[0-9]{1,3}$", pramsDict['target']):
+            http_status= 403
+            content= "not allowd!\nUsage: http://host/metrics?target=yourip"
+        else:
+            servers_status[pramsDict['target']]= 'server_check_up 1'
+            monitor_task(pramsDict['target'])
+            content= "data preparation!"
+            http_status= 501
+    else:
+        content= "I'm OK\nUsage: http://host/metrics?target=yourip"
+
+    res_headers= {'Content-Type': 'text/plain; charset=utf-8'}
+    return content.encode('utf8'), http_status, res_headers
+@web.route('/metrics/cache')
+def cache():
+    content= "当前缓存: "+ str(servers_status)
+    res_headers= {'Content-Type': 'text/plain; charset=utf-8'}
+    return content.encode('utf8'), 200, res_headers
+
+if __name__ == '__main__':
+    if os.environ.get("THREADING_MAX"): exp_config.threading_max= int(os.environ.get("THREADING_MAX"))
+    if os.environ.get("THREADING_TIMEOUT"): exp_config.threading_timeout= int(os.environ.get("THREADING_TIMEOUT"))
+    if os.environ.get("SCHEDULER_PERIOD_S"): exp_config.scheduler_period_s= int(os.environ.get("SCHEDULER_PERIOD_S"))
+    if os.environ.get("DEBUG") == "True" or os.environ.get("DEBUG")== True: exp_config.DEBUG= True
+    if os.environ.get("AUTH_U"): pserver.data["UserName"]= os.environ.get("AUTH_U")
+    if os.environ.get("AUTH_P"): pserver.data["Password"]= os.environ.get("AUTH_P")
+    logger= logging
+    if exp_config.DEBUG:
+        logLevel= logging.DEBUG
+    else:
+        logLevel= logging.INFO
+    logging.basicConfig(format='%(asctime)s %(levelname)s:%(message)s',datefmt='%Y-%m-%d %H:%M:%S', level= logLevel)
+    logger.info("Serving exporter on port 9998...")
+    web.run(host="0.0.0.0",port= 9998, debug=exp_config.DEBUG)
